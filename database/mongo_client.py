@@ -26,7 +26,12 @@ _client: Optional[MongoClient] = None
 def get_client() -> MongoClient:
     global _client
     if _client is None:
-        _client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=8000)
+        _client = MongoClient(
+            MONGO_URI,
+            serverSelectionTimeoutMS=8000,
+            tls=True,
+            tlsAllowInvalidCertificates=True,
+         )
         log.info("MongoDB connected → %s", MONGO_DB)
     return _client
 
