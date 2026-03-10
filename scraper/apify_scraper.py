@@ -140,7 +140,7 @@ def _prioritize(
 
 def _run_actor(run_input: Dict) -> Optional[Tuple[str, str]]:
     resp = requests.post(
-        f"{BASE}/acts/apify~instagram-profile-scraper/runs",
+        f"{BASE}/acts/apify~instagram-reel-scraper/runs",
         params={"token": APIFY_API_TOKEN},
         json=run_input,
         timeout=30,
@@ -318,7 +318,7 @@ def scrape_all_accounts(
         log.info("🔍 [%s] Scraping %d accounts × %d results = %d max reels",
                  acc_type, len(accs), per_acc, len(accs) * per_acc)
 
-        result = _run_actor({"usernames": accs, "resultsLimit": per_acc, "resultsType": "posts"})
+        result = _run_actor({"usernames": accs, "resultsLimit": per_acc})
         if not result:
             continue
 
