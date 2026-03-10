@@ -1,18 +1,3 @@
-"""
-insta_intel/scraper/apify_scraper.py
-
-FREE TIER OPTIMIZED — Apify $5/month credit manager.
-
-Strategy:
-  - Check remaining credit before every run
-  - Calculate exactly how many results we can afford
-  - Prioritize high-value accounts (never-scraped first, oldest-scraped next)
-  - Skip accounts scraped recently (smart dedup)
-  - Batch accounts to minimize actor run overhead
-  - Hard stop when credit threshold is reached
-  - Full usage report after every run
-"""
-
 from __future__ import annotations
 import math
 import time
@@ -26,24 +11,15 @@ from utils.helpers import get_logger, engagement_rate, safe_int, clean_caption, 
 log = get_logger(__name__)
 BASE = "https://api.apify.com/v2"
 
-# ── Free tier budget constants ────────────────────────────────
-COST_PER_RESULT_USD       = 0.004   # conservative estimate per reel result
-SAFETY_BUFFER_USD         = 0.50    # always keep $0.50 in reserve
-MIN_CREDIT_TO_RUN_USD     = 0.20    # don't start if less than $0.20 available
-FREE_TIER_MAX_PER_ACCOUNT = 10      # max reels per account on free tier
-FREE_TIER_MAX_PER_RUN     = 200     # hard cap on total results per pipeline run
-MIN_HOURS_BETWEEN_SCRAPES = 48      # don't re-scrape same account within 48 hrs
+COST_PER_RESULT_USD       = 0.004
+SAFETY_BUFFER_USD         = 0.50
+MIN_CREDIT_TO_RUN_USD     = 0.20
+FREE_TIER_MAX_PER_ACCOUNT = 10
+FREE_TIER_MAX_PER_RUN     = 200
+MIN_HOURS_BETWEEN_SCRAPES = 48
 
 
-# ═══════════════════════════════════════════════
-#  CREDIT MONITOR
-# ═══════════════════════════════════════════════
-
-def get_credit_balance() -> Dict[str, Any]:
-    """
-    Fetch current Apify account usage and remaining credit.
-    Returns dict with: available_usd, used_usd, limit_usd, can_run, max_results
-    """
+def get_credit_balance():
     try:
         resp = requests.get(
             f"{BASE}/users/me",
@@ -71,11 +47,11 @@ def get_credit_balance() -> Dict[str, Any]:
         }
 
         log.info(
-            "💳 Credit: $%.4f used / $%.2f limit → $%.4f available → %d results max",
+            "Credit: $%.4f used / $%.2f limit -> $%.4f available -> %d results max",
             used_usd, limit_usd, available_usd, result["max_results"],
         )
         if not can_run:
-            log.warning("⚠️  Insufficient credit ($%.4f). Skipping run.", available_usd)
+            log.warning("Insufficient credit ($%.4f). Skipping run.", available_usd)
 
         return result
 
@@ -84,12 +60,7 @@ def get_credit_balance() -> Dict[str, Any]:
         return {"available_usd": 0, "can_run": False}
 
 
-# ═══════════════════════════════════════════════
-#  SMART ACCOUNT PRIORITIZER
-# ═══════════════════════════════════════════════
-
-def _get_last_scraped_map() -> Dict[str, str]:
-    """Get most recent scraped_at date per account from MongoDB."""
+def _get_last_scraped_map():
     try:
         from database.mongo_client import reels_col
         pipeline = [{"$group": {"_id": "$competitor", "last": {"$max": "$scraped_at"}}}]
@@ -98,7 +69,7 @@ def _get_last_scraped_map() -> Dict[str, str]:
         return {}
 
 
-def _hours_since_scraped(username: str, last_map: Dict[str, str]) -> float:
+def _hours_since_scraped(username, last_map):
     last = last_map.get(username.lower())
     if not last:
         return float("inf")
@@ -109,36 +80,28 @@ def _hours_since_scraped(username: str, last_map: Dict[str, str]) -> float:
         return float("inf")
 
 
-def _prioritize(
-    usernames: List[str],
-    acc_type:  str,
-    last_map:  Dict[str, str],
-    max_accs:  int,
-) -> List[str]:
-    """
-    Return up to max_accs accounts, prioritized:
-      1. Never scraped before
-      2. Scraped longest ago (oldest first)
-      3. Skip anything scraped within MIN_HOURS_BETWEEN_SCRAPES
-    """
+def _prioritize(usernames, acc_type, last_map, max_accs):
     scored = [
         (u, _hours_since_scraped(u, last_map))
         for u in usernames
         if _hours_since_scraped(u, last_map) >= MIN_HOURS_BETWEEN_SCRAPES
     ]
-    scored.sort(key=lambda x: -x[1])   # most stale first
+    scored.sort(key=lambda x: -x[1])
     selected = [u for u, _ in scored[:max_accs]]
     skipped  = len(usernames) - len(selected)
-    log.info("[%s] Selected %d/%d accounts — %d skipped (scraped recently)",
-             acc_type, len(selected), len(usernames), skipped)
+    log.info(
+        "[%s] Selected %d/%d accounts -- %d skipped (scraped recently)",
+        acc_type, len(selected), len(usernames), skipped
+    )
     return selected
 
 
-# ═══════════════════════════════════════════════
-#  ACTOR HELPERS
-# ═══════════════════════════════════════════════
-
-def _run_actor(run_input: Dict) -> Optional[Tuple[str, str]]:
+def _run_actor(username, max_reels):
+    """Run apify instagram-reel-scraper for a single username."""
+    run_input = {
+        "username": username,
+        "maxReels": max_reels,
+    }
     resp = requests.post(
         f"{BASE}/acts/apify~instagram-reel-scraper/runs",
         params={"token": APIFY_API_TOKEN},
@@ -149,74 +112,105 @@ def _run_actor(run_input: Dict) -> Optional[Tuple[str, str]]:
         log.error("Actor start failed %s: %s", resp.status_code, resp.text[:200])
         return None
     data = resp.json().get("data", {})
-    log.info("▶  Run started → %s", data.get("id"))
+    log.info("Run started -> %s", data.get("id"))
     return data.get("id"), data.get("defaultDatasetId")
 
 
-def _poll_run(run_id: str, timeout_s: int = 600) -> bool:
-    url, params, waited = f"{BASE}/actor-runs/{run_id}", {"token": APIFY_API_TOKEN}, 0
+def _poll_run(run_id, timeout_s=300):
+    url    = f"{BASE}/actor-runs/{run_id}"
+    params = {"token": APIFY_API_TOKEN}
+    waited = 0
     while waited < timeout_s:
-        time.sleep(15); waited += 15
+        time.sleep(10)
+        waited += 10
         try:
-            state = requests.get(url, params=params, timeout=10).json().get("data",{}).get("status","RUNNING")
-            log.debug("Run %s → %s (%ds)", run_id, state, waited)
-            if state == "SUCCEEDED": return True
-            if state in ("FAILED","ABORTED","TIMED-OUT"):
-                log.error("Run %s: %s", run_id, state); return False
+            state = (
+                requests.get(url, params=params, timeout=10)
+                .json().get("data", {}).get("status", "RUNNING")
+            )
+            log.debug("Run %s -> %s (%ds)", run_id, state, waited)
+            if state == "SUCCEEDED":
+                return True
+            if state in ("FAILED", "ABORTED", "TIMED-OUT"):
+                log.error("Run %s: %s", run_id, state)
+                return False
         except Exception as e:
             log.warning("Poll error: %s", e)
     return False
 
 
-def _fetch_dataset(dataset_id: str, limit: int = 500) -> List[Dict]:
+def _fetch_dataset(dataset_id, limit=50):
     resp = requests.get(
         f"{BASE}/datasets/{dataset_id}/items",
         params={"token": APIFY_API_TOKEN, "limit": limit},
         timeout=60,
     )
     items = resp.json() if resp.status_code == 200 else []
-    log.info("📦 Fetched %d raw items", len(items))
+    log.info("Fetched %d raw items", len(items))
     return items
 
 
-def _actual_cost(run_id: str) -> float:
+def _actual_cost(run_id):
     try:
         return round(
-            requests.get(f"{BASE}/actor-runs/{run_id}",
-                         params={"token": APIFY_API_TOKEN}, timeout=10)
-            .json().get("data",{}).get("usageTotalUsd", 0.0), 6
+            requests.get(
+                f"{BASE}/actor-runs/{run_id}",
+                params={"token": APIFY_API_TOKEN},
+                timeout=10,
+            ).json().get("data", {}).get("usageTotalUsd", 0.0), 6
         )
     except Exception:
         return 0.0
 
 
-# ═══════════════════════════════════════════════
-#  DATA NORMALISER
-# ═══════════════════════════════════════════════
-
-def _normalise(item: Dict, username: str, account_type: str) -> Optional[Dict]:
-    is_video = (
-        item.get("isVideo") is True
-        or str(item.get("type",      "")).upper() in ("VIDEO","REEL")
-        or str(item.get("mediaType", "")).upper() in ("VIDEO","REEL")
-        or item.get("videoUrl")      is not None
-        or item.get("videoDuration") is not None
+def _normalise(item, username, account_type):
+    """
+    Map raw apify~instagram-reel-scraper item to clean reel document.
+    This actor returns reels only so no video type check needed.
+    """
+    views     = safe_int(
+        item.get("videoViewCount") or
+        item.get("playsCount") or
+        item.get("videoPlayCount") or
+        item.get("viewsCount") or
+        item.get("plays") or 0
     )
-    if not is_video:
-        return None
-
-    views     = safe_int(item.get("videoViewCount") or item.get("playsCount") or item.get("videoPlayCount"))
-    likes     = safe_int(item.get("likesCount")    or item.get("likes"))
-    comments  = safe_int(item.get("commentsCount") or item.get("comments"))
-    shortcode = item.get("shortCode") or item.get("id","")
-    url       = item.get("url") or f"https://www.instagram.com/reel/{shortcode}/"
-    caption   = clean_caption(item.get("caption") or "")
-    ts        = item.get("timestamp") or item.get("takenAt") or ""
-    music     = item.get("musicInfo") or {}
+    likes     = safe_int(
+        item.get("likesCount") or
+        item.get("likes") or
+        item.get("diggCount") or 0
+    )
+    comments  = safe_int(
+        item.get("commentsCount") or
+        item.get("comments") or
+        item.get("commentCount") or 0
+    )
+    shortcode = (
+        item.get("shortCode") or
+        item.get("code") or
+        item.get("id") or ""
+    )
+    url = (
+        item.get("url") or
+        item.get("reelUrl") or
+        item.get("permalinkUrl") or
+        f"https://www.instagram.com/reel/{shortcode}/"
+    )
+    caption   = clean_caption(item.get("caption") or item.get("text") or "")
+    ts        = item.get("timestamp") or item.get("takenAt") or item.get("date") or ""
+    music     = item.get("musicInfo") or item.get("music") or {}
     audio     = (
-        music.get("musicName") or music.get("musicArtistName") or
-        item.get("audio") or "Original audio"
-    ) if isinstance(music, dict) else item.get("audio","Original audio")
+        music.get("musicName") or
+        music.get("name") or
+        music.get("musicArtistName") or
+        item.get("audio") or
+        item.get("audioTrack") or
+        "Original audio"
+    ) if isinstance(music, dict) else item.get("audio", "Original audio")
+
+    if not url or url == "https://www.instagram.com/reel//":
+        log.debug("Skipping item with no URL")
+        return None
 
     return {
         "competitor":      username.lower(),
@@ -236,13 +230,9 @@ def _normalise(item: Dict, username: str, account_type: str) -> Optional[Dict]:
     }
 
 
-# ═══════════════════════════════════════════════
-#  USAGE REPORT
-# ═══════════════════════════════════════════════
-
-def _usage_report(reels: int, cost: float, credit_before: float, accounts: int) -> None:
-    remaining  = max(0.0, credit_before - cost - SAFETY_BUFFER_USD)
-    runs_left  = int(remaining / max(cost, 0.001)) if cost > 0 else 999
+def _usage_report(reels, cost, credit_before, accounts):
+    remaining = max(0.0, credit_before - cost - SAFETY_BUFFER_USD)
+    runs_left = int(remaining / max(cost, 0.001)) if cost > 0 else 999
     log.info("")
     log.info("╔══════════════════════════════════════════╗")
     log.info("║        APIFY USAGE REPORT                ║")
@@ -251,63 +241,54 @@ def _usage_report(reels: int, cost: float, credit_before: float, accounts: int) 
     log.info("║  Reels collected  : %-4d                 ║", reels)
     log.info("║  This run cost    : $%-8.4f             ║", cost)
     log.info("║  Credit remaining : $%-8.4f             ║", remaining)
-    log.info("║  Est. runs left   : %-4s                 ║", str(runs_left) if runs_left < 999 else "∞")
+    log.info("║  Est. runs left   : %-4s                 ║", str(runs_left) if runs_left < 999 else "many")
     log.info("╚══════════════════════════════════════════╝")
     if remaining < 1.0:
-        log.warning("⚠️  Less than $1.00 remaining — consider upgrading to Starter ($29/mo)")
+        log.warning("Less than $1.00 remaining - consider upgrading to Starter ($29/mo)")
     if remaining < 0.50:
-        log.error("🚨 Under $0.50 remaining — pipeline will auto-pause next run")
+        log.error("Under $0.50 remaining - pipeline will auto-pause next run")
 
 
-# ═══════════════════════════════════════════════
-#  PUBLIC API
-# ═══════════════════════════════════════════════
-
-def scrape_all_accounts(
-    company_accounts: List[str],
-    creator_accounts: List[str],
-) -> List[Dict]:
+def scrape_all_accounts(company_accounts, creator_accounts):
     """
-    Main entry point. Fully free-tier-optimized scraping run.
-
-    1. Check credit balance — abort if insufficient
-    2. Calculate max affordable results
-    3. Prioritize unscraped / stalest accounts
-    4. Run actor for company accounts, then creator accounts
-    5. Print usage report
+    Main entry point. Scrapes reels one account at a time
+    using apify~instagram-reel-scraper.
     """
-    log.info("═" * 55)
+    log.info("=" * 55)
     log.info("  APIFY FREE TIER OPTIMIZED SCRAPER")
-    log.info("═" * 55)
+    log.info("=" * 55)
 
     # 1. Credit check
     credit = get_credit_balance()
     if not credit["can_run"]:
         return []
 
-    available         = credit["available_usd"]
-    max_results       = min(credit["max_results"], FREE_TIER_MAX_PER_RUN)
-    per_acc           = FREE_TIER_MAX_PER_ACCOUNT
+    available   = credit["available_usd"]
+    max_results = min(credit["max_results"], FREE_TIER_MAX_PER_RUN)
+    per_acc     = FREE_TIER_MAX_PER_ACCOUNT
 
     # 2. Split budget 60% company / 40% creator
-    company_slots = math.floor(max_results * 0.60) // per_acc
-    creator_slots = math.floor(max_results * 0.40) // per_acc
-    company_slots = max(1, company_slots)
-    creator_slots = max(1, creator_slots)
+    company_slots = max(1, math.floor(max_results * 0.60) // per_acc)
+    creator_slots = max(1, math.floor(max_results * 0.40) // per_acc)
 
-    log.info("📊 Budget: $%.4f → %d results max | %d company slots | %d creator slots",
-             available, max_results, company_slots * per_acc, creator_slots * per_acc)
+    log.info(
+        "Budget: $%.4f -> %d results max | %d company slots | %d creator slots",
+        available, max_results, company_slots * per_acc, creator_slots * per_acc
+    )
 
     # 3. Prioritize accounts
-    last_map = _get_last_scraped_map()
+    last_map    = _get_last_scraped_map()
     sel_company = _prioritize(company_accounts, "company", last_map, company_slots)
     sel_creator = _prioritize(creator_accounts, "creator", last_map, creator_slots)
 
     if not sel_company and not sel_creator:
-        log.warning("No accounts need scraping right now — all scraped within %dh", MIN_HOURS_BETWEEN_SCRAPES)
+        log.warning(
+            "No accounts need scraping -- all scraped within %dh",
+            MIN_HOURS_BETWEEN_SCRAPES
+        )
         return []
 
-    # 4. Run scraping
+    # 4. Scrape each account individually
     all_reels  = []
     total_cost = 0.0
 
@@ -315,46 +296,61 @@ def scrape_all_accounts(
         if not accs:
             continue
 
-        log.info("🔍 [%s] Scraping %d accounts × %d results = %d max reels",
-                 acc_type, len(accs), per_acc, len(accs) * per_acc)
+        log.info(
+            "[%s] Scraping %d accounts x %d reels each",
+            acc_type, len(accs), per_acc
+        )
 
-        result = _run_actor({"usernames": accs, "resultsLimit": per_acc})
-        if not result:
-            continue
+        for username in accs:
+            log.info("[%s] Starting @%s ...", acc_type, username)
 
-        run_id, dataset_id = result
-        if not _poll_run(run_id):
-            continue
+            result = _run_actor(username, per_acc)
+            if not result:
+                log.warning("[%s] Skipping @%s -- actor failed to start", acc_type, username)
+                continue
 
-        raw   = _fetch_dataset(dataset_id, limit=len(accs) * per_acc * 2)
-        cost  = _actual_cost(run_id)
-        total_cost += cost
-        log.info("💸 [%s] Run cost: $%.6f", acc_type, cost)
+            run_id, dataset_id = result
 
-        for item in raw:
-            owner   = (item.get("ownerUsername") or (item.get("owner") or {}).get("username","") or "").lower()
-            matched = next((u for u in accs if u.lower() == owner), accs[0])
-            doc     = _normalise(item, matched, acc_type)
-            if doc:
-                all_reels.append(doc)
+            if not _poll_run(run_id):
+                log.warning("[%s] @%s run did not succeed", acc_type, username)
+                continue
 
-        log.info("✅ [%s] %d reels normalised", acc_type,
-                 sum(1 for r in all_reels if r["account_type"] == acc_type))
+            raw  = _fetch_dataset(dataset_id, limit=per_acc * 2)
+            cost = _actual_cost(run_id)
+            total_cost += cost
+
+            log.info("[%s] @%s -> %d items fetched, cost $%.6f", acc_type, username, len(raw), cost)
+
+            count_before = len(all_reels)
+            for item in raw:
+                doc = _normalise(item, username, acc_type)
+                if doc:
+                    all_reels.append(doc)
+
+            added = len(all_reels) - count_before
+            log.info("[%s] @%s -> %d reels added", acc_type, username, added)
+
+            # Check if we are running low on credit
+            remaining = available - total_cost
+            if remaining < MIN_CREDIT_TO_RUN_USD:
+                log.warning("Credit running low ($%.4f) -- stopping early", remaining)
+                break
+
+            time.sleep(3)
 
     # 5. Usage report
     _usage_report(
-        reels          = len(all_reels),
-        cost           = total_cost,
-        credit_before  = available + SAFETY_BUFFER_USD,
-        accounts       = len(sel_company) + len(sel_creator),
+        reels         = len(all_reels),
+        cost          = total_cost,
+        credit_before = available + SAFETY_BUFFER_USD,
+        accounts      = len(sel_company) + len(sel_creator),
     )
 
     return all_reels
 
 
-# backwards-compat shim used by run_pipeline.py
-def scrape_profiles(usernames: List[str], account_type: str, results_per_account: int = 10) -> List[Dict]:
-    """Thin wrapper — routes to scrape_all_accounts."""
+def scrape_profiles(usernames, account_type, results_per_account=10):
+    """Backwards-compat wrapper."""
     return scrape_all_accounts(
         company_accounts = usernames if account_type == "company" else [],
         creator_accounts = usernames if account_type == "creator" else [],
