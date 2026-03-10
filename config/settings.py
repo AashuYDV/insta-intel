@@ -11,7 +11,7 @@ load_dotenv()
 
 # ── Apify ────────────────────────────────────────────────────
 APIFY_API_TOKEN        = os.getenv("APIFY_API_TOKEN", "")
-APIFY_ACTOR_ID         = "apify~instagram-profile-scraper"   # official profile scraper
+APIFY_ACTOR_ID         = "apify~instagram-reel-scraper"   # official profile scraper
 APIFY_RESULTS_PER_ACC  = int(os.getenv("APIFY_RESULTS_PER_ACC", "20"))
 
 # ── OpenAI ───────────────────────────────────────────────────
