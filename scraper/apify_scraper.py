@@ -99,7 +99,7 @@ def _prioritize(usernames, acc_type, last_map, max_accs):
 def _run_actor(username, max_reels):
     """Run apify instagram-reel-scraper for a single username."""
     run_input = {
-        "username": username,
+        "username": [username],
         "maxReels": max_reels,
     }
     resp = requests.post(
