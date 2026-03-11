@@ -1,16 +1,14 @@
 import os
-try:
-    import streamlit as st
-    _secrets = st.secrets
-except Exception:
-    _secrets = {}
 
 def _get(key, default=""):
-    # Try Streamlit secrets first, then environment variables
     try:
-        return _secrets[key]
+        import streamlit as st
+        val = st.secrets.get(key)
+        if val:
+            return val
     except Exception:
-        return os.getenv(key, default)
+        pass
+    return os.getenv(key, default)
 
 APIFY_API_TOKEN        = _get("APIFY_API_TOKEN")
 APIFY_ACTOR_ID         = "apify~instagram-reel-scraper"
@@ -25,10 +23,3 @@ MONGO_COLLECTION_ACCS  = "accounts"
 PIPELINE_INTERVAL_DAYS = int(_get("PIPELINE_INTERVAL_DAYS", "2"))
 DOWNLOAD_DIR           = _get("DOWNLOAD_DIR", "/tmp/insta_intel_videos")
 AUDIO_DIR              = _get("AUDIO_DIR", "/tmp/insta_intel_audio")
-```
-
----
-
-## Commit and wait 2 minutes
-```
-git commit message: "fix settings - read from st.secrets for Streamlit Cloud"
