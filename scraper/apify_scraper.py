@@ -97,7 +97,7 @@ def _prioritize(usernames, acc_type, last_map, max_accs):
 
 
 def _run_actor(username, max_reels):
-    """Run apify instagram-reel-scraper for a single username."""
+    """Run apify~instagram-reel-scraper for a single username."""
     run_input = {
         "username": [username],
         "maxReels": max_reels,
@@ -166,57 +166,85 @@ def _actual_cost(run_id):
 def _normalise(item, username, account_type):
     """
     Map raw apify~instagram-reel-scraper item to clean reel document.
-    This actor returns reels only so no video type check needed.
+
+    Field names verified against instagram-reel-scraper actor output:
+    - views     -> videoPlayCount (primary), fallback to viewsCount, playsCount
+    - likes     -> likesCount, fallback to diggCount
+    - comments  -> commentsCount, fallback to commentCount
+    - url       -> url, fallback to shortCode
+    - caption   -> caption, fallback to text
+    - timestamp -> timestamp, fallback to takenAt
+    - audio     -> musicInfo.musicName, fallback to Original audio
+    - videoUrl  -> videoUrl (stored for potential future download use)
     """
-    views     = safe_int(
-        item.get("videoViewCount") or
-        item.get("playsCount") or
-        item.get("videoPlayCount") or
-        item.get("viewsCount") or
-        item.get("plays") or 0
-    )
-    likes     = safe_int(
-        item.get("likesCount") or
-        item.get("likes") or
-        item.get("diggCount") or 0
-    )
-    comments  = safe_int(
-        item.get("commentsCount") or
-        item.get("comments") or
-        item.get("commentCount") or 0
-    )
-    shortcode = (
-        item.get("shortCode") or
-        item.get("code") or
-        item.get("id") or ""
-    )
+
+    # ── Views: try every known field name, skip 0-valued ones ──────────
+    views = 0
+    for field in ["videoPlayCount", "viewsCount", "playsCount", "videoViewCount", "plays"]:
+        val = safe_int(item.get(field))
+        if val and val > 0:
+            views = val
+            break
+
+    # ── Likes ────────────────────────────────────────────────────────────
+    likes = 0
+    for field in ["likesCount", "likes", "diggCount"]:
+        val = safe_int(item.get(field))
+        if val and val > 0:
+            likes = val
+            break
+
+    # ── Comments ─────────────────────────────────────────────────────────
+    comments = 0
+    for field in ["commentsCount", "comments", "commentCount"]:
+        val = safe_int(item.get(field))
+        if val and val > 0:
+            comments = val
+            break
+
+    # ── Identifiers ──────────────────────────────────────────────────────
+    shortcode = item.get("shortCode") or item.get("code") or item.get("id") or ""
     url = (
         item.get("url") or
         item.get("reelUrl") or
         item.get("permalinkUrl") or
-        f"https://www.instagram.com/reel/{shortcode}/"
+        (f"https://www.instagram.com/reel/{shortcode}/" if shortcode else None)
     )
-    caption   = clean_caption(item.get("caption") or item.get("text") or "")
-    ts        = item.get("timestamp") or item.get("takenAt") or item.get("date") or ""
-    music     = item.get("musicInfo") or item.get("music") or {}
-    audio     = (
-        music.get("musicName") or
-        music.get("name") or
-        music.get("musicArtistName") or
-        item.get("audio") or
-        item.get("audioTrack") or
-        "Original audio"
-    ) if isinstance(music, dict) else item.get("audio", "Original audio")
 
-    if not url or url == "https://www.instagram.com/reel//":
+    if not url:
         log.debug("Skipping item with no URL")
         return None
+
+    # ── Content ──────────────────────────────────────────────────────────
+    caption   = clean_caption(item.get("caption") or item.get("text") or "")
+    ts        = item.get("timestamp") or item.get("takenAt") or item.get("date") or ""
+    video_url = item.get("videoUrl") or item.get("video_url") or ""
+
+    # ── Audio ─────────────────────────────────────────────────────────────
+    music = item.get("musicInfo") or item.get("music") or {}
+    if isinstance(music, dict):
+        audio = (
+            music.get("musicName") or
+            music.get("name") or
+            music.get("musicArtistName") or
+            item.get("audio") or
+            "Original audio"
+        )
+    else:
+        audio = item.get("audio") or "Original audio"
+
+    # ── Log what we got for debugging ─────────────────────────────────────
+    log.debug(
+        "@%s | views=%d | likes=%d | comments=%d | shortcode=%s",
+        username, views, likes, comments, shortcode
+    )
 
     return {
         "competitor":      username.lower(),
         "account_type":    account_type,
         "reel_url":        url,
         "shortcode":       shortcode,
+        "video_url":       video_url,
         "caption":         caption,
         "views":           views,
         "likes":           likes,
@@ -228,6 +256,15 @@ def _normalise(item, username, account_type):
         "date":            ts[:10] if ts else today_str(),
         "scraped_at":      today_str(),
     }
+
+
+def _debug_raw_item(item, username):
+    """Log all fields from a raw Apify item for debugging."""
+    log.info("--- RAW ITEM DEBUG for @%s ---", username)
+    for key, val in item.items():
+        if key != "images":
+            log.info("  %s: %s", key, str(val)[:100])
+    log.info("--- END DEBUG ---")
 
 
 def _usage_report(reels, cost, credit_before, accounts):
@@ -291,6 +328,7 @@ def scrape_all_accounts(company_accounts, creator_accounts):
     # 4. Scrape each account individually
     all_reels  = []
     total_cost = 0.0
+    first_item_debugged = False
 
     for accs, acc_type in [(sel_company, "company"), (sel_creator, "creator")]:
         if not accs:
@@ -320,6 +358,11 @@ def scrape_all_accounts(company_accounts, creator_accounts):
             total_cost += cost
 
             log.info("[%s] @%s -> %d items fetched, cost $%.6f", acc_type, username, len(raw), cost)
+
+            # Debug first item of very first account so we can see all field names
+            if raw and not first_item_debugged:
+                _debug_raw_item(raw[0], username)
+                first_item_debugged = True
 
             count_before = len(all_reels)
             for item in raw:
