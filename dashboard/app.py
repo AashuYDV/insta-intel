@@ -71,20 +71,37 @@ DEMO = [
 @st.cache_data(ttl=300, show_spinner=False)
 def load_data():
     try:
-        from database.mongo_client import get_all_reels
-        reels = get_all_reels(limit=1000)
-        if reels and len(reels) > 0:
-            df = pd.DataFrame(reels)
-            if "ai_analysis" in df.columns:
-                for field in ["hook", "topic", "cta", "format", "summary"]:
-                    if field not in df.columns:
-                        df[field] = df["ai_analysis"].apply(
-                            lambda x: x.get(field, "") if isinstance(x, dict) else ""
-                        )
-            return df, True
-    except Exception:
-        pass
-    return pd.DataFrame(DEMO), False
+        from config.settings import MONGO_URI, MONGO_DB
+        if not MONGO_URI:
+            st.sidebar.error("MONGO_URI is empty — check Streamlit secrets")
+            return pd.DataFrame(DEMO), False
+
+        from pymongo import MongoClient
+        client = MongoClient(
+            MONGO_URI,
+            serverSelectionTimeoutMS=8000,
+            tls=True,
+            tlsAllowInvalidCertificates=True,
+        )
+        db   = client[MONGO_DB]
+        data = list(db["reels"].find({}, {"_id": 0}).limit(1000))
+
+        if not data:
+            st.sidebar.warning("MongoDB connected but reels collection is empty")
+            return pd.DataFrame(DEMO), False
+
+        df = pd.DataFrame(data)
+        if "ai_analysis" in df.columns:
+            for field in ["hook", "topic", "cta", "format", "summary"]:
+                if field not in df.columns:
+                    df[field] = df["ai_analysis"].apply(
+                        lambda x: x.get(field, "") if isinstance(x, dict) else ""
+                    )
+        return df, True
+
+    except Exception as e:
+        st.sidebar.error(f"MongoDB error: {e}")
+        return pd.DataFrame(DEMO), False
 
 
 df_raw, is_live = load_data()
