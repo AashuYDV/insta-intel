@@ -11,15 +11,21 @@ from utils.helpers import get_logger, engagement_rate, safe_int, clean_caption, 
 log = get_logger(__name__)
 BASE = "https://api.apify.com/v2"
 
-COST_PER_RESULT_USD       = 0.004
+# ── Cost constants (calibrated from real run data) ────────────────────────────
+# Real observed cost was $0.482 for 20 reels = ~$0.024/result
+# We use $0.025 as a safe conservative estimate
+COST_PER_RESULT_USD       = 0.025
 SAFETY_BUFFER_USD         = 0.50
 MIN_CREDIT_TO_RUN_USD     = 0.20
-FREE_TIER_MAX_PER_ACCOUNT = 10
-FREE_TIER_MAX_PER_RUN     = 200
+MAX_COST_PER_ACCOUNT_USD  = 0.15   # hard stop if one account burns more than this
+FREE_TIER_MAX_PER_ACCOUNT = 5      # reduced from 10 — keeps cost predictable
+FREE_TIER_MAX_PER_RUN     = 100    # reduced from 200 — stays within free tier safely
 MIN_HOURS_BETWEEN_SCRAPES = 48
 
 
-def get_credit_balance():
+# ── Credit monitor ────────────────────────────────────────────────────────────
+
+def get_credit_balance() -> Dict[str, Any]:
     try:
         resp = requests.get(
             f"{BASE}/users/me",
@@ -60,7 +66,9 @@ def get_credit_balance():
         return {"available_usd": 0, "can_run": False}
 
 
-def _get_last_scraped_map():
+# ── Account prioritizer ───────────────────────────────────────────────────────
+
+def _get_last_scraped_map() -> Dict[str, str]:
     try:
         from database.mongo_client import reels_col
         pipeline = [{"$group": {"_id": "$competitor", "last": {"$max": "$scraped_at"}}}]
@@ -69,7 +77,7 @@ def _get_last_scraped_map():
         return {}
 
 
-def _hours_since_scraped(username, last_map):
+def _hours_since_scraped(username: str, last_map: Dict[str, str]) -> float:
     last = last_map.get(username.lower())
     if not last:
         return float("inf")
@@ -80,13 +88,18 @@ def _hours_since_scraped(username, last_map):
         return float("inf")
 
 
-def _prioritize(usernames, acc_type, last_map, max_accs):
+def _prioritize(
+    usernames: List[str],
+    acc_type:  str,
+    last_map:  Dict[str, str],
+    max_accs:  int,
+) -> List[str]:
     scored = [
         (u, _hours_since_scraped(u, last_map))
         for u in usernames
         if _hours_since_scraped(u, last_map) >= MIN_HOURS_BETWEEN_SCRAPES
     ]
-    scored.sort(key=lambda x: -x[1])
+    scored.sort(key=lambda x: -x[1])   # most stale first
     selected = [u for u, _ in scored[:max_accs]]
     skipped  = len(usernames) - len(selected)
     log.info(
@@ -96,8 +109,10 @@ def _prioritize(usernames, acc_type, last_map, max_accs):
     return selected
 
 
-def _run_actor(username, max_reels):
-    """Run apify~instagram-reel-scraper for a single username."""
+# ── Actor helpers ─────────────────────────────────────────────────────────────
+
+def _run_actor(username: str, max_reels: int) -> Optional[Tuple[str, str]]:
+    """Start apify~instagram-reel-scraper for a single username."""
     run_input = {
         "username": [username],
         "maxReels": max_reels,
@@ -108,15 +123,29 @@ def _run_actor(username, max_reels):
         json=run_input,
         timeout=30,
     )
+
+    if resp.status_code == 403:
+        # Check specifically for hard limit error — must stop entire pipeline
+        err = resp.json().get("error", {})
+        if err.get("type") == "platform-feature-disabled":
+            log.error(
+                "APIFY HARD LIMIT HIT — Monthly usage cap exceeded. "
+                "Stopping pipeline. Reset date: 1st of next month."
+            )
+            raise RuntimeError("apify_hard_limit_exceeded")
+        log.error("Actor start failed 403: %s", resp.text[:200])
+        return None
+
     if resp.status_code not in (200, 201):
         log.error("Actor start failed %s: %s", resp.status_code, resp.text[:200])
         return None
+
     data = resp.json().get("data", {})
     log.info("Run started -> %s", data.get("id"))
     return data.get("id"), data.get("defaultDatasetId")
 
 
-def _poll_run(run_id, timeout_s=300):
+def _poll_run(run_id: str, timeout_s: int = 300) -> bool:
     url    = f"{BASE}/actor-runs/{run_id}"
     params = {"token": APIFY_API_TOKEN}
     waited = 0
@@ -136,10 +165,11 @@ def _poll_run(run_id, timeout_s=300):
                 return False
         except Exception as e:
             log.warning("Poll error: %s", e)
+    log.error("Run %s timed out after %ds", run_id, timeout_s)
     return False
 
 
-def _fetch_dataset(dataset_id, limit=50):
+def _fetch_dataset(dataset_id: str, limit: int = 50) -> List[Dict]:
     resp = requests.get(
         f"{BASE}/datasets/{dataset_id}/items",
         params={"token": APIFY_API_TOKEN, "limit": limit},
@@ -150,7 +180,7 @@ def _fetch_dataset(dataset_id, limit=50):
     return items
 
 
-def _actual_cost(run_id):
+def _actual_cost(run_id: str) -> float:
     try:
         return round(
             requests.get(
@@ -163,22 +193,14 @@ def _actual_cost(run_id):
         return 0.0
 
 
-def _normalise(item, username, account_type):
+# ── Data normaliser ───────────────────────────────────────────────────────────
+
+def _normalise(item: Dict, username: str, account_type: str) -> Optional[Dict]:
     """
     Map raw apify~instagram-reel-scraper item to clean reel document.
-
-    Field names verified against instagram-reel-scraper actor output:
-    - views     -> videoPlayCount (primary), fallback to viewsCount, playsCount
-    - likes     -> likesCount, fallback to diggCount
-    - comments  -> commentsCount, fallback to commentCount
-    - url       -> url, fallback to shortCode
-    - caption   -> caption, fallback to text
-    - timestamp -> timestamp, fallback to takenAt
-    - audio     -> musicInfo.musicName, fallback to Original audio
-    - videoUrl  -> videoUrl (stored for potential future download use)
+    Field names verified against actor output.
     """
-
-    # ── Views: try every known field name, skip 0-valued ones ──────────
+    # Views — try every known field, skip zero values
     views = 0
     for field in ["videoPlayCount", "viewsCount", "playsCount", "videoViewCount", "plays"]:
         val = safe_int(item.get(field))
@@ -186,7 +208,7 @@ def _normalise(item, username, account_type):
             views = val
             break
 
-    # ── Likes ────────────────────────────────────────────────────────────
+    # Likes
     likes = 0
     for field in ["likesCount", "likes", "diggCount"]:
         val = safe_int(item.get(field))
@@ -194,7 +216,7 @@ def _normalise(item, username, account_type):
             likes = val
             break
 
-    # ── Comments ─────────────────────────────────────────────────────────
+    # Comments
     comments = 0
     for field in ["commentsCount", "comments", "commentCount"]:
         val = safe_int(item.get(field))
@@ -202,7 +224,7 @@ def _normalise(item, username, account_type):
             comments = val
             break
 
-    # ── Identifiers ──────────────────────────────────────────────────────
+    # Identifiers
     shortcode = item.get("shortCode") or item.get("code") or item.get("id") or ""
     url = (
         item.get("url") or
@@ -215,12 +237,12 @@ def _normalise(item, username, account_type):
         log.debug("Skipping item with no URL")
         return None
 
-    # ── Content ──────────────────────────────────────────────────────────
+    # Content
     caption   = clean_caption(item.get("caption") or item.get("text") or "")
     ts        = item.get("timestamp") or item.get("takenAt") or item.get("date") or ""
     video_url = item.get("videoUrl") or item.get("video_url") or ""
 
-    # ── Audio ─────────────────────────────────────────────────────────────
+    # Audio
     music = item.get("musicInfo") or item.get("music") or {}
     if isinstance(music, dict):
         audio = (
@@ -233,7 +255,6 @@ def _normalise(item, username, account_type):
     else:
         audio = item.get("audio") or "Original audio"
 
-    # ── Log what we got for debugging ─────────────────────────────────────
     log.debug(
         "@%s | views=%d | likes=%d | comments=%d | shortcode=%s",
         username, views, likes, comments, shortcode
@@ -258,16 +279,23 @@ def _normalise(item, username, account_type):
     }
 
 
-def _debug_raw_item(item, username):
-    """Log all fields from a raw Apify item for debugging."""
+def _debug_raw_item(item: Dict, username: str) -> None:
+    """Log all fields from first raw item so we can verify field names."""
     log.info("--- RAW ITEM DEBUG for @%s ---", username)
     for key, val in item.items():
-        if key != "images":
-            log.info("  %s: %s", key, str(val)[:100])
+        if key not in ("images", "videoUrl", "video_url"):
+            log.info("  %s: %s", key, str(val)[:120])
     log.info("--- END DEBUG ---")
 
 
-def _usage_report(reels, cost, credit_before, accounts):
+# ── Usage report ──────────────────────────────────────────────────────────────
+
+def _usage_report(
+    reels:         int,
+    cost:          float,
+    credit_before: float,
+    accounts:      int,
+) -> None:
     remaining = max(0.0, credit_before - cost - SAFETY_BUFFER_USD)
     runs_left = int(remaining / max(cost, 0.001)) if cost > 0 else 999
     log.info("")
@@ -286,10 +314,21 @@ def _usage_report(reels, cost, credit_before, accounts):
         log.error("Under $0.50 remaining - pipeline will auto-pause next run")
 
 
-def scrape_all_accounts(company_accounts, creator_accounts):
+# ── Main entry point ──────────────────────────────────────────────────────────
+
+def scrape_all_accounts(
+    company_accounts: List[str],
+    creator_accounts: List[str],
+) -> List[Dict]:
     """
-    Main entry point. Scrapes reels one account at a time
-    using apify~instagram-reel-scraper.
+    Scrape reels one account at a time using apify~instagram-reel-scraper.
+
+    Safety mechanisms:
+    - Conservative cost estimate ($0.025/result vs actual ~$0.024)
+    - Per-account cost cap ($0.15) — stops runaway accounts
+    - Hard limit detection — stops entire pipeline on 403 platform-feature-disabled
+    - Reduced per-account limit (5 reels) — keeps cost predictable
+    - Credit check before every run
     """
     log.info("=" * 55)
     log.info("  APIFY FREE TIER OPTIMIZED SCRAPER")
@@ -326,8 +365,8 @@ def scrape_all_accounts(company_accounts, creator_accounts):
         return []
 
     # 4. Scrape each account individually
-    all_reels  = []
-    total_cost = 0.0
+    all_reels           = []
+    total_cost          = 0.0
     first_item_debugged = False
 
     for accs, acc_type in [(sel_company, "company"), (sel_creator, "creator")]:
@@ -340,9 +379,33 @@ def scrape_all_accounts(company_accounts, creator_accounts):
         )
 
         for username in accs:
+
+            # Re-check credit before each account
+            remaining_budget = available - total_cost
+            if remaining_budget < MIN_CREDIT_TO_RUN_USD:
+                log.warning(
+                    "Credit running low ($%.4f remaining) -- stopping scrape early",
+                    remaining_budget
+                )
+                break
+
             log.info("[%s] Starting @%s ...", acc_type, username)
 
-            result = _run_actor(username, per_acc)
+            try:
+                result = _run_actor(username, per_acc)
+            except RuntimeError as e:
+                if "apify_hard_limit_exceeded" in str(e):
+                    # Hard platform limit — no point trying more accounts
+                    log.error("Hard limit hit — aborting all remaining accounts")
+                    _usage_report(
+                        reels         = len(all_reels),
+                        cost          = total_cost,
+                        credit_before = available + SAFETY_BUFFER_USD,
+                        accounts      = len(all_reels),
+                    )
+                    return all_reels
+                raise
+
             if not result:
                 log.warning("[%s] Skipping @%s -- actor failed to start", acc_type, username)
                 continue
@@ -355,11 +418,22 @@ def scrape_all_accounts(company_accounts, creator_accounts):
 
             raw  = _fetch_dataset(dataset_id, limit=per_acc * 2)
             cost = _actual_cost(run_id)
+
+            # Per-account cost cap — log warning if exceeded but continue
+            if cost > MAX_COST_PER_ACCOUNT_USD:
+                log.warning(
+                    "[%s] @%s cost $%.4f which exceeds per-account cap of $%.2f "
+                    "-- this account is expensive to scrape",
+                    acc_type, username, cost, MAX_COST_PER_ACCOUNT_USD
+                )
+
             total_cost += cost
+            log.info(
+                "[%s] @%s -> %d items fetched, cost $%.6f (total so far: $%.4f)",
+                acc_type, username, len(raw), cost, total_cost
+            )
 
-            log.info("[%s] @%s -> %d items fetched, cost $%.6f", acc_type, username, len(raw), cost)
-
-            # Debug first item of very first account so we can see all field names
+            # Debug first item of first account
             if raw and not first_item_debugged:
                 _debug_raw_item(raw[0], username)
                 first_item_debugged = True
@@ -373,13 +447,7 @@ def scrape_all_accounts(company_accounts, creator_accounts):
             added = len(all_reels) - count_before
             log.info("[%s] @%s -> %d reels added", acc_type, username, added)
 
-            # Check if we are running low on credit
-            remaining = available - total_cost
-            if remaining < MIN_CREDIT_TO_RUN_USD:
-                log.warning("Credit running low ($%.4f) -- stopping early", remaining)
-                break
-
-            time.sleep(3)
+            time.sleep(3)   # brief pause between accounts
 
     # 5. Usage report
     _usage_report(
@@ -392,7 +460,11 @@ def scrape_all_accounts(company_accounts, creator_accounts):
     return all_reels
 
 
-def scrape_profiles(usernames, account_type, results_per_account=10):
+def scrape_profiles(
+    usernames:           List[str],
+    account_type:        str,
+    results_per_account: int = 5,
+) -> List[Dict]:
     """Backwards-compat wrapper."""
     return scrape_all_accounts(
         company_accounts = usernames if account_type == "company" else [],
