@@ -1,31 +1,39 @@
 from __future__ import annotations
+
 import math
 import time
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Tuple
 
 from config.settings import APIFY_API_TOKEN
 from utils.helpers import get_logger, engagement_rate, safe_int, clean_caption, today_str
 
-log = get_logger(__name__)
+log  = get_logger(__name__)
 BASE = "https://api.apify.com/v2"
 
-# ── Cost constants (calibrated from real run data) ────────────────────────────
-# Real observed cost was $0.482 for 20 reels = ~$0.024/result
-# We use $0.025 as a safe conservative estimate
-COST_PER_RESULT_USD       = 0.025
+# ── Cost constants ─────────────────────────────────────────────────────────────
+# Actor: apify/instagram-scraper  |  resultsType: reels
+# Pricing: $2.30 per 1,000 results = $0.0023 per result (confirmed from Apify docs)
+COST_PER_RESULT_USD       = 0.0023   # confirmed — NOT 0.004 or 0.025
 SAFETY_BUFFER_USD         = 0.50
-MIN_CREDIT_TO_RUN_USD     = 0.20
-MAX_COST_PER_ACCOUNT_USD  = 0.15   # hard stop if one account burns more than this
-FREE_TIER_MAX_PER_ACCOUNT = 5      # reduced from 10 — keeps cost predictable
-FREE_TIER_MAX_PER_RUN     = 100    # reduced from 200 — stays within free tier safely
+MIN_CREDIT_TO_RUN_USD     = 0.10
+MAX_COST_PER_ACCOUNT_USD  = 0.05     # 20 reels * $0.0023 = $0.046 — cap at $0.05
+RESULTS_PER_ACCOUNT       = 10       # reels to fetch per account
+MAX_RESULTS_PER_RUN       = 210      # 21 accounts * 10 reels = 210 total
 MIN_HOURS_BETWEEN_SCRAPES = 48
+POLL_TIMEOUT_S            = 90       # reduced from 300 — fast-fail timed-out accounts
+POLL_INTERVAL_S           = 8        # check every 8 seconds
 
 
-# ── Credit monitor ────────────────────────────────────────────────────────────
+# ── Credit monitor ─────────────────────────────────────────────────────────────
 
 def get_credit_balance() -> Dict[str, Any]:
+    """
+    Fetch current Apify usage and calculate available credits.
+    WARNING: The Apify API can return stale data — treat this as approximate.
+    Always check actual run costs via _actual_cost() after each run.
+    """
     try:
         resp = requests.get(
             f"{BASE}/users/me",
@@ -66,7 +74,7 @@ def get_credit_balance() -> Dict[str, Any]:
         return {"available_usd": 0, "can_run": False}
 
 
-# ── Account prioritizer ───────────────────────────────────────────────────────
+# ── Account prioritizer ────────────────────────────────────────────────────────
 
 def _get_last_scraped_map() -> Dict[str, str]:
     try:
@@ -104,234 +112,332 @@ def _prioritize(
     skipped  = len(usernames) - len(selected)
     log.info(
         "[%s] Selected %d/%d accounts -- %d skipped (scraped recently)",
-        acc_type, len(selected), len(usernames), skipped
+        acc_type, len(selected), len(usernames), skipped,
     )
     return selected
 
 
-# ── Actor helpers ─────────────────────────────────────────────────────────────
+# ── Actor: apify/instagram-scraper ─────────────────────────────────────────────
 
-def _run_actor(username: str, max_reels: int) -> Optional[Tuple[str, str]]:
-    """Start apify~instagram-reel-scraper for a single username."""
-    run_input = {
-        "username": [username],
-        "maxReels": max_reels,
+def _build_actor_input(username: str, results_limit: int) -> Dict:
+    """
+    Build input for apify/instagram-scraper.
+
+    Key decisions:
+    - directUrls: full profile URL required (not just username string)
+    - resultsType: "reels" — returns only Video/clips posts, no images or carousels
+    - onlyPostsNewerThan: 60 days ago — prevents old pinned posts from wasting quota
+    - addParentData: false — reduces response payload size
+    """
+    sixty_days_ago = (datetime.utcnow() - timedelta(days=60)).strftime("%Y-%m-%d")
+    return {
+        "directUrls":         [f"https://www.instagram.com/{username}/"],
+        "resultsType":        "reels",
+        "resultsLimit":       results_limit,
+        "onlyPostsNewerThan": sixty_days_ago,
+        "addParentData":      False,
     }
+
+
+def _run_actor(username: str, results_limit: int) -> Optional[Tuple[str, str]]:
+    """
+    Start apify/instagram-scraper for a single username.
+    Returns (run_id, dataset_id) on success, None on failure.
+    Raises RuntimeError("apify_hard_limit_exceeded") if monthly cap is hit.
+    """
+    run_input = _build_actor_input(username, results_limit)
+
+    log.debug(
+        "Starting actor for @%s | limit=%d | newerThan=%s",
+        username, results_limit, run_input["onlyPostsNewerThan"],
+    )
+
     resp = requests.post(
-        f"{BASE}/acts/apify~instagram-reel-scraper/runs",
+        f"{BASE}/acts/apify~instagram-scraper/runs",
         params={"token": APIFY_API_TOKEN},
         json=run_input,
         timeout=30,
     )
 
     if resp.status_code == 403:
-        # Check specifically for hard limit error — must stop entire pipeline
-        err = resp.json().get("error", {})
-        if err.get("type") == "platform-feature-disabled":
+        try:
+            err = resp.json().get("error", {})
+        except Exception:
+            err = {}
+        err_type = err.get("type", "")
+        if err_type in ("platform-feature-disabled", "monthly-usage-exceeded"):
             log.error(
-                "APIFY HARD LIMIT HIT — Monthly usage cap exceeded. "
-                "Stopping pipeline. Reset date: 1st of next month."
+                "APIFY HARD LIMIT HIT -- Monthly cap exceeded. "
+                "Stopping pipeline immediately. Reset: 1st of next month."
             )
             raise RuntimeError("apify_hard_limit_exceeded")
-        log.error("Actor start failed 403: %s", resp.text[:200])
+        log.error("Actor start failed 403: %s", resp.text[:300])
         return None
 
     if resp.status_code not in (200, 201):
-        log.error("Actor start failed %s: %s", resp.status_code, resp.text[:200])
+        log.error("Actor start failed %s: %s", resp.status_code, resp.text[:300])
         return None
 
-    data = resp.json().get("data", {})
-    log.info("Run started -> %s", data.get("id"))
-    return data.get("id"), data.get("defaultDatasetId")
+    data       = resp.json().get("data", {})
+    run_id     = data.get("id")
+    dataset_id = data.get("defaultDatasetId")
+    log.info("Run started for @%s -> run_id=%s", username, run_id)
+    return run_id, dataset_id
 
 
-def _poll_run(run_id: str, timeout_s: int = 300) -> bool:
+def _poll_run(run_id: str, timeout_s: int = POLL_TIMEOUT_S) -> bool:
+    """
+    Poll until run succeeds, fails, or times out.
+    Timeout is 90s — fast-fails accounts with bot-detection / compute hangs.
+    On timeout, aborts the run to prevent further credit drain.
+    """
     url    = f"{BASE}/actor-runs/{run_id}"
     params = {"token": APIFY_API_TOKEN}
     waited = 0
+
     while waited < timeout_s:
-        time.sleep(10)
-        waited += 10
+        time.sleep(POLL_INTERVAL_S)
+        waited += POLL_INTERVAL_S
         try:
             state = (
                 requests.get(url, params=params, timeout=10)
                 .json().get("data", {}).get("status", "RUNNING")
             )
-            log.debug("Run %s -> %s (%ds)", run_id, state, waited)
+            log.debug("Run %s -> %s (%ds elapsed)", run_id, state, waited)
+
             if state == "SUCCEEDED":
+                log.info("Run %s succeeded after %ds", run_id, waited)
                 return True
             if state in ("FAILED", "ABORTED", "TIMED-OUT"):
-                log.error("Run %s: %s", run_id, state)
+                log.error("Run %s terminal state: %s", run_id, state)
                 return False
+
         except Exception as e:
-            log.warning("Poll error: %s", e)
-    log.error("Run %s timed out after %ds", run_id, timeout_s)
+            log.warning("Poll error for run %s: %s", run_id, e)
+
+    log.error(
+        "Run %s timed out after %ds -- aborting to prevent credit drain.",
+        run_id, timeout_s,
+    )
+    # Abort the hung run to stop it consuming more compute credits
+    try:
+        requests.post(
+            f"{BASE}/actor-runs/{run_id}/abort",
+            params={"token": APIFY_API_TOKEN},
+            timeout=10,
+        )
+        log.info("Aborted hung run %s", run_id)
+    except Exception:
+        pass
+
     return False
 
 
-def _fetch_dataset(dataset_id: str, limit: int = 50) -> List[Dict]:
+def _fetch_dataset(dataset_id: str, limit: int) -> List[Dict]:
     resp = requests.get(
         f"{BASE}/datasets/{dataset_id}/items",
         params={"token": APIFY_API_TOKEN, "limit": limit},
         timeout=60,
     )
     items = resp.json() if resp.status_code == 200 else []
-    log.info("Fetched %d raw items", len(items))
+    log.info("Fetched %d raw items from dataset %s", len(items), dataset_id)
     return items
 
 
 def _actual_cost(run_id: str) -> float:
+    """Fetch the real cost of a completed run from the Apify API."""
     try:
         return round(
             requests.get(
                 f"{BASE}/actor-runs/{run_id}",
                 params={"token": APIFY_API_TOKEN},
                 timeout=10,
-            ).json().get("data", {}).get("usageTotalUsd", 0.0), 6
+            ).json().get("data", {}).get("usageTotalUsd", 0.0),
+            6,
         )
     except Exception:
         return 0.0
 
 
-# ── Data normaliser ───────────────────────────────────────────────────────────
+# ── Data normaliser ────────────────────────────────────────────────────────────
 
 def _normalise(item: Dict, username: str, account_type: str) -> Optional[Dict]:
     """
-    Map raw apify~instagram-reel-scraper item to clean reel document.
-    Field names verified against actor output.
+    Map raw apify/instagram-scraper (resultsType=reels) item to clean reel document.
+
+    Field names verified against real API output (leverageedu, 2026-03-12):
+        type            : "Video"          — always Video for reels endpoint
+        productType     : "clips"          — confirms it's a Reel
+        videoPlayCount  : total plays      — USE THIS for views (3-11x higher)
+        videoViewCount  : unique viewers   — lower, less representative
+        likesCount      : likes
+        commentsCount   : comments
+        timestamp       : ISO datetime
+        shortCode       : unique ID        — used for MongoDB dedup
+        videoUrl        : CDN mp4 link
+        displayUrl      : thumbnail image
+        isPinned        : bool             — skip these
+        musicInfo       : {song_name, artist_name, uses_original_audio, audio_id}
+
+    Filters applied:
+        1. isPinned=True  -> skip (old evergreen posts pollute trend analysis)
+        2. type != Video  -> skip (safety net, shouldn't appear with resultsType=reels)
+        3. No URL         -> skip (can't store or link to reel)
     """
-    # Views — try every known field, skip zero values
-    views = 0
-    for field in ["videoPlayCount", "viewsCount", "playsCount", "videoViewCount", "plays"]:
-        val = safe_int(item.get(field))
-        if val and val > 0:
-            views = val
-            break
+    # Filter 1: Skip pinned posts
+    if item.get("isPinned") is True:
+        log.debug("Skipping pinned post %s by @%s", item.get("shortCode"), username)
+        return None
 
-    # Likes
-    likes = 0
-    for field in ["likesCount", "likes", "diggCount"]:
-        val = safe_int(item.get(field))
-        if val and val > 0:
-            likes = val
-            break
+    # Filter 2: Skip non-video (safety net)
+    post_type = item.get("type", "Video")
+    if post_type and post_type != "Video":
+        log.debug("Skipping non-video (type=%s) by @%s", post_type, username)
+        return None
 
-    # Comments
-    comments = 0
-    for field in ["commentsCount", "comments", "commentCount"]:
-        val = safe_int(item.get(field))
-        if val and val > 0:
-            comments = val
-            break
+    # ── Metrics ──────────────────────────────────────────────────────────────
+    views    = safe_int(item.get("videoPlayCount")) or safe_int(item.get("videoViewCount")) or 0
+    likes    = safe_int(item.get("likesCount")) or 0
+    comments = safe_int(item.get("commentsCount")) or 0
 
-    # Identifiers
-    shortcode = item.get("shortCode") or item.get("code") or item.get("id") or ""
-    url = (
+    # ── Identifiers ──────────────────────────────────────────────────────────
+    shortcode = item.get("shortCode") or item.get("id") or ""
+    url       = (
         item.get("url") or
-        item.get("reelUrl") or
-        item.get("permalinkUrl") or
-        (f"https://www.instagram.com/reel/{shortcode}/" if shortcode else None)
+        (f"https://www.instagram.com/p/{shortcode}/" if shortcode else None)
     )
 
     if not url:
-        log.debug("Skipping item with no URL")
+        log.debug("Skipping item with no URL from @%s", username)
         return None
 
-    # Content
-    caption   = clean_caption(item.get("caption") or item.get("text") or "")
-    ts        = item.get("timestamp") or item.get("takenAt") or item.get("date") or ""
-    video_url = item.get("videoUrl") or item.get("video_url") or ""
+    # ── Content ───────────────────────────────────────────────────────────────
+    caption   = clean_caption(item.get("caption") or "")
+    ts        = item.get("timestamp") or ""
+    video_url = item.get("videoUrl") or ""
+    duration  = item.get("videoDuration") or 0
 
-    # Audio
-    music = item.get("musicInfo") or item.get("music") or {}
+    # Thumbnail: prefer displayUrl, fall back to first image in images array
+    images    = item.get("images") or []
+    thumbnail = item.get("displayUrl") or (images[0] if images else "")
+
+    # ── Audio ─────────────────────────────────────────────────────────────────
+    music = item.get("musicInfo") or {}
     if isinstance(music, dict):
-        audio = (
-            music.get("musicName") or
-            music.get("name") or
-            music.get("musicArtistName") or
-            item.get("audio") or
-            "Original audio"
-        )
+        song_name     = music.get("song_name") or "Original audio"
+        artist_name   = music.get("artist_name") or username
+        uses_original = bool(music.get("uses_original_audio", False))
+        audio_id      = str(music.get("audio_id") or "")
+        audio_label   = "Original audio" if uses_original else f"{song_name} - {artist_name}"
     else:
-        audio = item.get("audio") or "Original audio"
+        song_name     = "Original audio"
+        artist_name   = username
+        uses_original = True
+        audio_id      = ""
+        audio_label   = "Original audio"
 
     log.debug(
         "@%s | views=%d | likes=%d | comments=%d | shortcode=%s",
-        username, views, likes, comments, shortcode
+        username, views, likes, comments, shortcode,
     )
 
     return {
-        "competitor":      username.lower(),
-        "account_type":    account_type,
-        "reel_url":        url,
-        "shortcode":       shortcode,
-        "video_url":       video_url,
-        "caption":         caption,
-        "views":           views,
-        "likes":           likes,
-        "comments":        comments,
-        "engagement_rate": engagement_rate(likes, comments, views),
-        "audio":           str(audio)[:200],
-        "transcript":      "",
-        "ai_analysis":     {},
-        "date":            ts[:10] if ts else today_str(),
-        "scraped_at":      today_str(),
+        # Identity
+        "competitor":          username.lower(),
+        "account_type":        account_type,
+        "shortcode":           shortcode,
+        "reel_url":            url,
+        "video_url":           video_url,
+        "thumbnail_url":       thumbnail,
+
+        # Content
+        "caption":             caption,
+        "duration_seconds":    round(float(duration), 1),
+
+        # Metrics
+        "views":               views,
+        "likes":               likes,
+        "comments":            comments,
+        "engagement_rate":     engagement_rate(likes, comments, views),
+
+        # Audio
+        "audio":               audio_label[:200],
+        "audio_song":          song_name[:200],
+        "audio_artist":        artist_name[:200],
+        "audio_id":            audio_id,
+        "uses_original_audio": uses_original,
+
+        # AI fields (populated later by ai_analysis.py)
+        "transcript":          "",
+        "ai_analysis":         {},
+
+        # Timestamps
+        "date":                ts[:10] if ts else today_str(),
+        "scraped_at":          today_str(),
     }
 
 
 def _debug_raw_item(item: Dict, username: str) -> None:
-    """Log all fields from first raw item so we can verify field names."""
+    """Log key fields from first raw item to verify field mapping is correct."""
     log.info("--- RAW ITEM DEBUG for @%s ---", username)
+    skip_keys = {
+        "images", "videoUrl", "audioUrl", "displayUrl",
+        "latestComments", "childPosts", "coauthorProducers", "taggedUsers",
+    }
     for key, val in item.items():
-        if key not in ("images", "videoUrl", "video_url"):
-            log.info("  %s: %s", key, str(val)[:120])
+        if key not in skip_keys:
+            log.info("  %-25s : %s", key, str(val)[:150])
     log.info("--- END DEBUG ---")
 
 
-# ── Usage report ──────────────────────────────────────────────────────────────
+# ── Usage report ───────────────────────────────────────────────────────────────
 
 def _usage_report(
     reels:         int,
     cost:          float,
     credit_before: float,
-    accounts:      int,
+    accounts_done: int,
 ) -> None:
     remaining = max(0.0, credit_before - cost - SAFETY_BUFFER_USD)
-    runs_left = int(remaining / max(cost, 0.001)) if cost > 0 else 999
     log.info("")
     log.info("╔══════════════════════════════════════════╗")
-    log.info("║        APIFY USAGE REPORT                ║")
+    log.info("║         APIFY USAGE REPORT               ║")
     log.info("╠══════════════════════════════════════════╣")
-    log.info("║  Accounts scraped : %-4d                 ║", accounts)
+    log.info("║  Accounts scraped : %-4d                 ║", accounts_done)
     log.info("║  Reels collected  : %-4d                 ║", reels)
     log.info("║  This run cost    : $%-8.4f             ║", cost)
     log.info("║  Credit remaining : $%-8.4f             ║", remaining)
-    log.info("║  Est. runs left   : %-4s                 ║", str(runs_left) if runs_left < 999 else "many")
     log.info("╚══════════════════════════════════════════╝")
     if remaining < 1.0:
-        log.warning("Less than $1.00 remaining - consider upgrading to Starter ($29/mo)")
+        log.warning("Under $1.00 remaining -- consider upgrading to Starter ($29/mo)")
     if remaining < 0.50:
-        log.error("Under $0.50 remaining - pipeline will auto-pause next run")
+        log.error("Under $0.50 remaining -- pipeline will auto-pause next run")
 
 
-# ── Main entry point ──────────────────────────────────────────────────────────
+# ── Main entry point ───────────────────────────────────────────────────────────
 
 def scrape_all_accounts(
     company_accounts: List[str],
     creator_accounts: List[str],
 ) -> List[Dict]:
     """
-    Scrape reels one account at a time using apify~instagram-reel-scraper.
+    Scrape reels for all accounts using apify/instagram-scraper with resultsType=reels.
 
-    Safety mechanisms:
-    - Conservative cost estimate ($0.025/result vs actual ~$0.024)
-    - Per-account cost cap ($0.15) — stops runaway accounts
-    - Hard limit detection — stops entire pipeline on 403 platform-feature-disabled
-    - Reduced per-account limit (5 reels) — keeps cost predictable
-    - Credit check before every run
+    Actor:   apify/instagram-scraper  (correct — NOT apify~instagram-reel-scraper)
+    Pricing: $0.0023/result
+    Cost:    21 accounts x 10 reels = 210 results = ~$0.48 per full run
+    Free tier ($5/mo): ~10 full pipeline runs per month
+
+    Data quality guarantees:
+    - Only reels (no images, no carousels)
+    - Only non-pinned posts (no old viral content polluting trends)
+    - Only posts from last 60 days
+    - videoPlayCount used for views (most accurate metric)
     """
     log.info("=" * 55)
-    log.info("  APIFY FREE TIER OPTIMIZED SCRAPER")
+    log.info("  APIFY INSTAGRAM SCRAPER")
+    log.info("  Actor : apify/instagram-scraper")
+    log.info("  Type  : reels | Cost: $%.4f/result", COST_PER_RESULT_USD)
     log.info("=" * 55)
 
     # 1. Credit check
@@ -340,19 +446,20 @@ def scrape_all_accounts(
         return []
 
     available   = credit["available_usd"]
-    max_results = min(credit["max_results"], FREE_TIER_MAX_PER_RUN)
-    per_acc     = FREE_TIER_MAX_PER_ACCOUNT
+    max_results = min(credit["max_results"], MAX_RESULTS_PER_RUN)
+    per_acc     = RESULTS_PER_ACCOUNT
 
-    # 2. Split budget 60% company / 40% creator
-    company_slots = max(1, math.floor(max_results * 0.60) // per_acc)
-    creator_slots = max(1, math.floor(max_results * 0.40) // per_acc)
+    # 2. Split budget: 60% company, 40% creator
+    total_slots   = max(1, max_results // per_acc)
+    company_slots = max(1, math.floor(total_slots * 0.60))
+    creator_slots = max(1, math.floor(total_slots * 0.40))
 
     log.info(
-        "Budget: $%.4f -> %d results max | %d company slots | %d creator slots",
-        available, max_results, company_slots * per_acc, creator_slots * per_acc
+        "Budget: $%.4f -> %d result slots | %d company | %d creator",
+        available, max_results, company_slots * per_acc, creator_slots * per_acc,
     )
 
-    # 3. Prioritize accounts
+    # 3. Prioritize (most stale accounts first)
     last_map    = _get_last_scraped_map()
     sel_company = _prioritize(company_accounts, "company", last_map, company_slots)
     sel_creator = _prioritize(creator_accounts, "creator", last_map, creator_slots)
@@ -360,13 +467,14 @@ def scrape_all_accounts(
     if not sel_company and not sel_creator:
         log.warning(
             "No accounts need scraping -- all scraped within %dh",
-            MIN_HOURS_BETWEEN_SCRAPES
+            MIN_HOURS_BETWEEN_SCRAPES,
         )
         return []
 
     # 4. Scrape each account individually
     all_reels           = []
     total_cost          = 0.0
+    accounts_done       = 0
     first_item_debugged = False
 
     for accs, acc_type in [(sel_company, "company"), (sel_creator, "creator")]:
@@ -375,33 +483,33 @@ def scrape_all_accounts(
 
         log.info(
             "[%s] Scraping %d accounts x %d reels each",
-            acc_type, len(accs), per_acc
+            acc_type, len(accs), per_acc,
         )
 
         for username in accs:
 
-            # Re-check credit before each account
+            # Re-check budget before each account
             remaining_budget = available - total_cost
             if remaining_budget < MIN_CREDIT_TO_RUN_USD:
                 log.warning(
-                    "Credit running low ($%.4f remaining) -- stopping scrape early",
-                    remaining_budget
+                    "Budget running low ($%.4f remaining) -- stopping early",
+                    remaining_budget,
                 )
                 break
 
-            log.info("[%s] Starting @%s ...", acc_type, username)
+            log.info("[%s] -- Scraping @%s --", acc_type, username)
 
+            # Start actor run
             try:
                 result = _run_actor(username, per_acc)
             except RuntimeError as e:
                 if "apify_hard_limit_exceeded" in str(e):
-                    # Hard platform limit — no point trying more accounts
-                    log.error("Hard limit hit — aborting all remaining accounts")
+                    log.error("Hard limit hit -- aborting all remaining accounts")
                     _usage_report(
                         reels         = len(all_reels),
                         cost          = total_cost,
                         credit_before = available + SAFETY_BUFFER_USD,
-                        accounts      = len(all_reels),
+                        accounts_done = accounts_done,
                     )
                     return all_reels
                 raise
@@ -412,28 +520,36 @@ def scrape_all_accounts(
 
             run_id, dataset_id = result
 
-            if not _poll_run(run_id):
-                log.warning("[%s] @%s run did not succeed", acc_type, username)
+            # Poll for completion (90s timeout with auto-abort)
+            succeeded = _poll_run(run_id)
+
+            # Always record cost — compute is consumed even on failure/timeout
+            cost        = _actual_cost(run_id)
+            total_cost += cost
+
+            if not succeeded:
+                log.warning(
+                    "[%s] @%s run did not succeed | cost $%.5f | total $%.4f",
+                    acc_type, username, cost, total_cost,
+                )
                 continue
 
-            raw  = _fetch_dataset(dataset_id, limit=per_acc * 2)
-            cost = _actual_cost(run_id)
+            # Fetch and normalise results
+            raw = _fetch_dataset(dataset_id, limit=per_acc + 5)
 
-            # Per-account cost cap — log warning if exceeded but continue
             if cost > MAX_COST_PER_ACCOUNT_USD:
                 log.warning(
-                    "[%s] @%s cost $%.4f which exceeds per-account cap of $%.2f "
-                    "-- this account is expensive to scrape",
-                    acc_type, username, cost, MAX_COST_PER_ACCOUNT_USD
+                    "[%s] @%s cost $%.4f -- over per-account cap of $%.3f",
+                    acc_type, username, cost, MAX_COST_PER_ACCOUNT_USD,
                 )
 
-            total_cost += cost
+            accounts_done += 1
             log.info(
-                "[%s] @%s -> %d items fetched, cost $%.6f (total so far: $%.4f)",
-                acc_type, username, len(raw), cost, total_cost
+                "[%s] @%s -> %d raw items | cost $%.5f | total $%.4f",
+                acc_type, username, len(raw), cost, total_cost,
             )
 
-            # Debug first item of first account
+            # Debug field names on first successful item (run once per pipeline execution)
             if raw and not first_item_debugged:
                 _debug_raw_item(raw[0], username)
                 first_item_debugged = True
@@ -444,29 +560,34 @@ def scrape_all_accounts(
                 if doc:
                     all_reels.append(doc)
 
-            added = len(all_reels) - count_before
-            log.info("[%s] @%s -> %d reels added", acc_type, username, added)
+            added    = len(all_reels) - count_before
+            filtered = len(raw) - added
+            log.info(
+                "[%s] @%s -> %d added | %d filtered (pinned/non-video/no-url)",
+                acc_type, username, added, filtered,
+            )
 
-            time.sleep(3)   # brief pause between accounts
+            time.sleep(3)  # polite pause between accounts
 
-    # 5. Usage report
+    # 5. Final usage report
     _usage_report(
         reels         = len(all_reels),
         cost          = total_cost,
         credit_before = available + SAFETY_BUFFER_USD,
-        accounts      = len(sel_company) + len(sel_creator),
+        accounts_done = accounts_done,
     )
 
+    log.info("Scrape complete -- %d total reels collected", len(all_reels))
     return all_reels
 
 
 def scrape_profiles(
     usernames:           List[str],
     account_type:        str,
-    results_per_account: int = 5,
+    results_per_account: int = RESULTS_PER_ACCOUNT,
 ) -> List[Dict]:
-    """Backwards-compat wrapper."""
+    """Backwards-compatible wrapper used by run_pipeline.py."""
     return scrape_all_accounts(
-        company_accounts = usernames if account_type == "company" else [],
-        creator_accounts = usernames if account_type == "creator" else [],
+        company_accounts=usernames if account_type == "company" else [],
+        creator_accounts=usernames if account_type == "creator" else [],
     )
